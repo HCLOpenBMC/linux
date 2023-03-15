@@ -21,6 +21,8 @@
 #include <linux/reset.h>
 #include <linux/slab.h>
 
+#include "dw-i3c-master.h"
+
 #define DEVICE_CTRL			0x0
 #define DEV_CTRL_ENABLE			BIT(31)
 #define DEV_CTRL_RESUME			BIT(30)
@@ -201,11 +203,6 @@
 
 #define XFER_TIMEOUT (msecs_to_jiffies(1000))
 
-struct dw_i3c_master_caps {
-	u8 cmdfifodepth;
-	u8 datafifodepth;
-};
-
 struct dw_i3c_cmd {
 	u32 cmd_lo;
 	u32 cmd_hi;
@@ -222,25 +219,6 @@ struct dw_i3c_xfer {
 	int ret;
 	unsigned int ncmds;
 	struct dw_i3c_cmd cmds[];
-};
-
-struct dw_i3c_master {
-	struct i3c_master_controller base;
-	u16 maxdevs;
-	u16 datstartaddr;
-	u32 free_pos;
-	struct {
-		struct list_head list;
-		struct dw_i3c_xfer *cur;
-		spinlock_t lock;
-	} xferqueue;
-	struct dw_i3c_master_caps caps;
-	void __iomem *regs;
-	struct reset_control *core_rst;
-	struct clk *core_clk;
-	char version[5];
-	char type[5];
-	u8 addrs[MAX_DEVS];
 };
 
 struct dw_i3c_i2c_dev_data {
@@ -515,11 +493,23 @@ static void dw_i3c_master_end_xfer_locked(struct dw_i3c_master *master, u32 isr)
 	dw_i3c_master_start_xfer_locked(master);
 }
 
-static int dw_i3c_clk_cfg(struct dw_i3c_master *master)
+static const struct {
+	unsigned int freq;
+	unsigned int shift;
+} sdrs[] = {
+	{ I3C_BUS_SDR1_SCL_RATE, 0 },
+	{ I3C_BUS_SDR2_SCL_RATE, 8 },
+	{ I3C_BUS_SDR3_SCL_RATE, 16 },
+	{ I3C_BUS_SDR4_SCL_RATE, 24 },
+};
+
+static int dw_i3c_clk_cfg(struct dw_i3c_master *master, unsigned long i3c_rate,
+			  bool pure)
 {
 	unsigned long core_rate, core_period;
+	u8 tmp, hcnt, lcnt, lcnt_od;
 	u32 scl_timing;
-	u8 hcnt, lcnt;
+	unsigned int i;
 
 	core_rate = clk_get_rate(master->core_clk);
 	if (!core_rate)
@@ -527,32 +517,55 @@ static int dw_i3c_clk_cfg(struct dw_i3c_master *master)
 
 	core_period = DIV_ROUND_UP(1000000000, core_rate);
 
-	hcnt = DIV_ROUND_UP(I3C_BUS_THIGH_MAX_NS, core_period) - 1;
+	/*
+	 * In pure mode, use a 50% duty cycle at the configured frequency.
+	 *
+	 * In shared mode, we limit t_high, so that i3c SCL signalling is
+	 * rejected by the i2c devices' spike filter
+	 */
+	if (pure)
+		hcnt = DIV_ROUND_UP(core_rate, i3c_rate * 2);
+	else
+		hcnt = DIV_ROUND_UP(I3C_BUS_THIGH_MAX_NS, core_period) - 1;
+
+	/* Ensure our count values are acceptable to hardware */
 	if (hcnt < SCL_I3C_TIMING_CNT_MIN)
 		hcnt = SCL_I3C_TIMING_CNT_MIN;
 
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_TYP_I3C_SCL_RATE) - hcnt;
+	lcnt = DIV_ROUND_UP(core_rate, i3c_rate) - hcnt;
 	if (lcnt < SCL_I3C_TIMING_CNT_MIN)
 		lcnt = SCL_I3C_TIMING_CNT_MIN;
 
 	scl_timing = SCL_I3C_TIMING_HCNT(hcnt) | SCL_I3C_TIMING_LCNT(lcnt);
 	writel(scl_timing, master->regs + SCL_I3C_PP_TIMING);
 
-	if (!(readl(master->regs + DEVICE_CTRL) & DEV_CTRL_I2C_SLAVE_PRESENT))
+	if (pure)
 		writel(BUS_I3C_MST_FREE(lcnt), master->regs + BUS_FREE_TIMING);
 
-	lcnt = DIV_ROUND_UP(I3C_BUS_TLOW_OD_MIN_NS, core_period);
-	scl_timing = SCL_I3C_TIMING_HCNT(hcnt) | SCL_I3C_TIMING_LCNT(lcnt);
+	/*
+	 * Open drain mode requires a (larger) minimum of OD_MIN_NS, in
+	 * order to allow for the longer signal rise time
+	 */
+	lcnt_od = lcnt;
+	tmp = DIV_ROUND_UP(I3C_BUS_TLOW_OD_MIN_NS, core_period);
+	if (lcnt_od < tmp)
+		lcnt_od = tmp;
+
+	scl_timing = SCL_I3C_TIMING_HCNT(hcnt) | SCL_I3C_TIMING_LCNT(lcnt_od);
 	writel(scl_timing, master->regs + SCL_I3C_OD_TIMING);
 
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_SDR1_SCL_RATE) - hcnt;
-	scl_timing = SCL_EXT_LCNT_1(lcnt);
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_SDR2_SCL_RATE) - hcnt;
-	scl_timing |= SCL_EXT_LCNT_2(lcnt);
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_SDR3_SCL_RATE) - hcnt;
-	scl_timing |= SCL_EXT_LCNT_3(lcnt);
-	lcnt = DIV_ROUND_UP(core_rate, I3C_BUS_SDR4_SCL_RATE) - hcnt;
-	scl_timing |= SCL_EXT_LCNT_4(lcnt);
+	/*
+	 * Timings for lower SDRx rates where specified by device MXDS values;
+	 * we limit these to the global max rate provided, which also prevents
+	 * weird duty cycles
+	 */
+	scl_timing = 0;
+	for (i = 0; i < ARRAY_SIZE(sdrs); i++) {
+		tmp = DIV_ROUND_UP(core_rate, sdrs[i].freq) & 0xff;
+		if (tmp < lcnt)
+			tmp = lcnt;
+		scl_timing |= tmp << sdrs[i].shift;
+	}
 	writel(scl_timing, master->regs + SCL_EXT_LCNT_TIMING);
 
 	return 0;
@@ -597,6 +610,10 @@ static int dw_i3c_master_bus_init(struct i3c_master_controller *m)
 	u32 thld_ctrl;
 	int ret;
 
+	ret = master->platform_ops->init(master);
+	if (ret)
+		return ret;
+
 	switch (bus->mode) {
 	case I3C_BUS_MODE_MIXED_FAST:
 	case I3C_BUS_MODE_MIXED_LIMITED:
@@ -605,7 +622,8 @@ static int dw_i3c_master_bus_init(struct i3c_master_controller *m)
 			return ret;
 		fallthrough;
 	case I3C_BUS_MODE_PURE:
-		ret = dw_i3c_clk_cfg(master);
+		ret = dw_i3c_clk_cfg(master, bus->scl_rate.i3c,
+				     bus->mode == I3C_BUS_MODE_PURE);
 		if (ret)
 			return ret;
 		break;
@@ -1112,14 +1130,25 @@ static const struct i3c_master_controller_ops dw_mipi_i3c_ops = {
 	.i2c_xfers = dw_i3c_master_i2c_xfers,
 };
 
-static int dw_i3c_probe(struct platform_device *pdev)
+/* default platform ops implementations */
+static int dw_i3c_platform_init_nop(struct dw_i3c_master *i3c)
 {
-	struct dw_i3c_master *master;
+	return 0;
+}
+
+static const struct dw_i3c_platform_ops dw_i3c_platform_ops_default = {
+	.init = dw_i3c_platform_init_nop,
+};
+
+int dw_i3c_master_probe(struct dw_i3c_master *master,
+			struct platform_device *pdev,
+			const struct dw_i3c_platform_ops *ops,
+			void *platform_data)
+{
 	int ret, irq;
 
-	master = devm_kzalloc(&pdev->dev, sizeof(*master), GFP_KERNEL);
-	if (!master)
-		return -ENOMEM;
+	master->platform_ops = ops ?: &dw_i3c_platform_ops_default;
+	master->platform_data = platform_data;
 
 	master->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(master->regs))
@@ -1180,10 +1209,10 @@ err_disable_core_clk:
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(dw_i3c_master_probe);
 
-static int dw_i3c_remove(struct platform_device *pdev)
+int dw_i3c_master_remove(struct dw_i3c_master *master)
 {
-	struct dw_i3c_master *master = platform_get_drvdata(pdev);
 	int ret;
 
 	ret = i3c_master_unregister(&master->base);
@@ -1195,6 +1224,27 @@ static int dw_i3c_remove(struct platform_device *pdev)
 	clk_disable_unprepare(master->core_clk);
 
 	return 0;
+}
+EXPORT_SYMBOL_GPL(dw_i3c_master_remove);
+
+/* base platform implementation */
+
+static int dw_i3c_probe(struct platform_device *pdev)
+{
+	struct dw_i3c_master *master;
+
+	master = devm_kmalloc(&pdev->dev, sizeof(*master), GFP_KERNEL);
+	if (!master)
+		return -ENOMEM;
+
+	return dw_i3c_master_probe(master, pdev, NULL, NULL);
+}
+
+static int dw_i3c_remove(struct platform_device *pdev)
+{
+	struct dw_i3c_master *master = platform_get_drvdata(pdev);
+
+	return dw_i3c_master_remove(master);
 }
 
 static const struct of_device_id dw_i3c_master_of_match[] = {
